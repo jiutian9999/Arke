@@ -1,0 +1,33 @@
+name: Build Windows EXE
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - uses: actions/checkout@v4
+    
+    - name: Install Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: stable
+        target: x86_64-pc-windows-msvc
+        override: true
+    
+    - name: Build Release
+      run: cargo build --release --locked
+      
+    - name: Run tests
+      run: cargo test --release --locked
+      
+    - name: Upload EXE
+      uses: actions/upload-artifact@v4
+      with:
+        name: arke-windows-exe
+        path: target/release/*.exe
+        retention-days: 30
