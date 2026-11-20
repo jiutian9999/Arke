@@ -8,7 +8,6 @@
 //!                                           memory (see `bench_index.rs`)
 //!   arke --no-resident [path]   don't use or become the resident process
 //!   arke --quit                 quit the resident process
-//!   arke --home                 what Win+E runs while "Open folders in Arke" is on: opens a window
 //!                               like starting Arke (Settings › "New windows open to")
 //!   arke --restore-explorer     undo the folder handler registration and turn the setting off
 //!   arke --uninstall [--keep-settings] [--quiet] [--dry-run]
@@ -92,7 +91,6 @@ mod win;
 mod win_cloud;
 mod win_devnotify;
 mod win_dragimage;
-mod win_e_hook;
 mod win_eject;
 mod win_fast_recycle;
 mod win_fileops;
@@ -119,50 +117,35 @@ mod workspace;
 #[cfg(test)]
 mod tests;
 
-// UI string tables (locales/*.yml, embedded at compile time); falls back to English
 rust_i18n::i18n!("locales", fallback = "en");
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use arke_core::RealFs;
 use gpui::{
-    App, AppContext, Bounds, QuitMode, TitlebarOptions, WindowBounds, WindowOptions, px, size,
 };
 use gpui_platform::application;
 
 use crate::assets::Assets;
-use crate::bench::{Bench, BenchMode};
 use crate::explorer::Services;
-use crate::instance::{NEW_WINDOW_ARG, OpenRequest, Page, Request, SendOutcome};
 use crate::win::WinShell;
 use crate::workspace::Workspace;
 use arke_core::takeover::Target;
 
 /// What `--bench` asked for.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BenchArg {
-    /// Opens a window and measures it (`bench.rs`)
-    Window(BenchMode),
     /// `--bench index`: headless index benchmark, no window (`bench_index.rs`)
     Index,
 }
 
 #[allow(
     clippy::struct_excessive_bools,
-    reason = "One bool per command line flag"
 )]
 struct Args {
-    path: Option<PathBuf>,
-    bench: Option<BenchArg>,
-    bench_out: Option<PathBuf>,
     resident: bool,
     quit: bool,
     /// Stay in the background without opening a window (used for autostart at Windows sign-in)
     background: bool,
-    /// Open a page instead of a folder (`--home`, or the folder handler got Home / the Recycle Bin)
-    page: Option<Page>,
     /// Undo the folder handler registration, then exit
     restore_explorer: bool,
     /// A window of its own, not a tab in the window used last (`--new-window`)
@@ -173,7 +156,6 @@ fn parse_args() -> Args {
     parse_args_from(std::env::args_os().skip(1))
 }
 
-fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
     let mut args = Args {
         path: None,
         bench: None,
@@ -190,23 +172,17 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
             Some("--bench") => {
                 args.bench = Some(match it.next().as_ref().and_then(|s| s.to_str()) {
                     Some("index") => BenchArg::Index,
-                    Some("scroll") => BenchArg::Window(BenchMode::Scroll),
-                    Some("scroll-grid") => BenchArg::Window(BenchMode::ScrollGrid),
-                    _ => BenchArg::Window(BenchMode::Startup),
                 });
             }
             Some("--bench-out") => args.bench_out = it.next().map(PathBuf::from),
             Some("--no-resident") => args.resident = false,
             Some("--quit") => args.quit = true,
             Some("--background") => args.background = true,
-            // Win+E's registration (folder_handler.rs). It used to open Home; now Win+E starts
             // like Arke itself, last tabs included (#73). The name stays: it is in the registry.
             Some("--home") => {}
             Some("--restore-explorer") => args.restore_explorer = true,
-            Some(NEW_WINDOW_ARG) => args.new_window = true,
             // Just updated: the old process's pid follows (already waited for at the start of
             // app_main).
-            Some(update::AFTER_UPDATE_ARG) => {
                 let _ = it.next();
                 update::mark_just_updated();
             }
@@ -227,21 +203,16 @@ fn parse_args_from(mut it: impl Iterator<Item = std::ffi::OsString>) -> Args {
 /// drive root `%1` ends in a backslash (`"C:\"`), which the command line rules read as an escaped
 /// quote: the argument arrives as `C:"`. The quote is the leftover of that, so it goes and the
 /// backslash comes back.
-fn path_arg(arg: &std::ffi::OsStr) -> PathBuf {
-    use std::os::windows::ffi::{OsStrExt, OsStringExt};
-    let mut units: Vec<u16> = arg.encode_wide().collect();
     if units.last() == Some(&u16::from(b'"')) {
         units.pop();
         if units.last() != Some(&u16::from(b'\\')) {
             units.push(u16::from(b'\\'));
         }
     }
-    PathBuf::from(std::ffi::OsString::from_wide(&units))
 }
 
 impl Args {
     /// The window benchmark to run, if any.
-    const fn window_bench(&self) -> Option<BenchMode> {
         match self.bench {
             Some(BenchArg::Window(mode)) => Some(mode),
             _ => None,
@@ -251,70 +222,45 @@ impl Args {
 
 fn unix_ms_now() -> u64 {
     SystemTime::now()
-        .duration_since(UNIX_EPOCH)
         .map_or(0, |d| d.as_millis() as u64)
 }
 
 /// Convert another process's launch time to an `Instant` here, so measurements start at launch.
 fn instant_from_unix_ms(launched_unix_ms: u64) -> Instant {
-    let ago = Duration::from_millis(unix_ms_now().saturating_sub(launched_unix_ms));
     let now = Instant::now();
     now.checked_sub(ago).unwrap_or(now)
 }
 
 /// Single binary: `arke.exe --indexd <command>` is the background service (arke-indexd) and opens
 /// no window.
-const INDEXD_ARG: &str = "--indexd";
 
-fn main() -> std::process::ExitCode {
-    let args: Vec<String> = std::env::args().collect();
-    if args.get(1).map(String::as_str) == Some(INDEXD_ARG) {
-        return arke_indexd::cli::run(args[2..].to_vec(), Some(INDEXD_ARG));
     }
-    // Before app_main: no log file (it would hold %LOCALAPPDATA%\Arke open), residency or window.
-    if args.get(1).map(String::as_str) == Some(uninstall::ARG) {
         rust_i18n::set_locale(&win::ui_locale());
         return uninstall::run_cli(&args[2..]);
     }
     // A Browse button's file dialog, shown in its own process (see `win_picker.rs`).
-    if args.get(1).map(String::as_str) == Some(win_picker::PICK_ARG) {
         win_picker::run();
-        return std::process::ExitCode::SUCCESS;
     }
     let mut args = parse_args();
     // As the folder handler the shell hands over every folder, virtual ones included: what Arke
-    // can't show goes to Explorer right away, before anything is initialized.
     if let Some(target) = args.path.as_deref().and_then(Path::to_str) {
         match arke_core::takeover::route_argument(target) {
-            arke_core::takeover::Route::Explorer(target) => {
                 win::open_in_explorer(&target);
-                return std::process::ExitCode::SUCCESS;
             }
-            // Home, This PC and Quick access are where File Explorer starts from Start or the
-            // taskbar: File Explorer started on purpose stays File Explorer unless Win+E is meant to
             // open Arke too.
-            arke_core::takeover::Route::Arke(Target::Home) if !settings::home_opens_arke() => {
                 win::open_in_explorer(target);
-                return std::process::ExitCode::SUCCESS;
             }
-            // Win+E, Start or the taskbar meant "open the file explorer": start like Arke itself
             // does, where Settings › "New windows open to" says (last tabs included) (#73).
-            arke_core::takeover::Route::Arke(Target::Home) => {
                 args.path = None;
             }
-            arke_core::takeover::Route::Arke(Target::RecycleBin) => {
                 args.path = None;
-                args.page = Some(Page::RecycleBin);
             }
-            arke_core::takeover::Route::Arke(Target::Folder(_)) => {}
         }
     }
     // Nothing else starts: no log file, tray, window or resident process.
     if args.restore_explorer {
         return if folder_handler::restore_cli() {
-            std::process::ExitCode::SUCCESS
         } else {
-            std::process::ExitCode::FAILURE
         };
     }
     // Before anything in app_main: no log file, residency handoff, tray or window.
@@ -322,7 +268,6 @@ fn main() -> std::process::ExitCode {
         return bench_index::run(args.bench_out.as_deref());
     }
     app_main(args);
-    std::process::ExitCode::SUCCESS
 }
 
 #[allow(
@@ -334,7 +279,6 @@ fn app_main(mut args: Args) {
         return;
     }
     // Launched by the old version (auto-update): wait for it to exit before taking over residency.
-    update::wait_for_previous(&std::env::args().collect::<Vec<_>>());
     let started_at = Instant::now();
     // A launch in the background opens no window; any it opens later is no cold start.
     if !args.background {
@@ -348,11 +292,9 @@ fn app_main(mut args: Args) {
     // From here any filesystem call on this thread trips a debug assertion.
     arke_core::fs::mark_ui_thread();
 
-    // Relative paths resolve against the launching process's cwd, so make them absolute before
     // handing off. std::path::absolute is string handling only (GetFullPathNameW) and never touches
     // the filesystem.
     if let Some(path) = &args.path
-        && let Ok(abs) = std::path::absolute(path)
     {
         args.path = Some(abs);
     }
@@ -360,14 +302,9 @@ fn app_main(mut args: Args) {
     // `arke --quit` (the installer before it replaces the exe): returns once the resident Arke is
     // gone, so its files are free.
     if args.quit {
-        // Only this copy: the installer and uninstaller of one copy must not close another.
-        let Ok(exe) = std::env::current_exe() else {
             return;
         };
-        match instance::quit_resident_of(&exe, Duration::from_secs(10)) {
             instance::Quit::Gone => log::info!("--quit: resident Arke gone"),
-            instance::Quit::StillRunning => log::info!("--quit: resident Arke still running"),
-            instance::Quit::OtherCopy(other) => log::info!(
                 "--quit: the resident Arke is another copy ({}), left running",
                 other.display()
             ),
@@ -384,9 +321,7 @@ fn app_main(mut args: Args) {
         }
     } else if args.resident || args.quit {
         let request = if args.quit {
-            Request::Quit
         } else {
-            Request::Open(OpenRequest {
                 path: args.path.clone(),
                 bench: args.window_bench(),
                 bench_out: args.bench_out.clone(),
@@ -396,7 +331,6 @@ fn app_main(mut args: Args) {
             })
         };
         match hand_off(&request) {
-            HandOff::Done => {
                 // A "Show in folder" caller may still be selecting: stay until the stand-in
                 // shell window is done.
                 if let Some(linger) = linger {
@@ -404,8 +338,6 @@ fn app_main(mut args: Args) {
                 }
                 return;
             }
-            HandOff::BecomeResident(listener) => Some(listener),
-            HandOff::Standalone => None,
         }
     } else {
         None
@@ -434,7 +366,6 @@ fn app_main(mut args: Args) {
     let app = application().with_assets(Assets);
     // gpui on Windows quits when the last window closes; resident mode decides when to quit itself.
     let app = if resident {
-        app.with_quit_mode(QuitMode::Explicit)
     } else {
         app
     };
@@ -443,7 +374,6 @@ fn app_main(mut args: Args) {
         motion::sync_app(cx);
         frame_probe::init();
         // Settings load in the background; benchmarks neither read nor write, so test folders don't
-        // land in Recent.
         let store = settings::SettingsStore::init(
             if bench.is_some() {
                 None
@@ -455,7 +385,6 @@ fn app_main(mut args: Args) {
         // Keys, with the shortcuts changed in Settings
         commands::init(&store, cx);
         // Per-folder views, next to the settings file; benchmarks keep them in memory only
-        folder_views::FolderViewStore::init(
             if bench.is_some() {
                 None
             } else {
@@ -493,17 +422,13 @@ fn app_main(mut args: Args) {
         follow_language_setting(&store, cx);
         let remotes = remote_shell::start(&store, cx);
         let services = Services {
-            fs: Arc::new(arke_remote::RoutingFs::new(
-                Arc::new(RealFs),
                 Arc::clone(&remotes),
             )),
-            shell: Arc::new(remote_shell::RemoteShell::new(
                 Arc::new(WinShell),
                 Arc::clone(&remotes),
             )),
             remotes,
         };
-        // "Open in VS Code/Zed": check in the background whether they're installed.
         if bench.is_none() {
             let shell = Arc::clone(&services.shell);
             explorer::spawn_thread("editor-apps", move || {
@@ -525,7 +450,6 @@ fn app_main(mut args: Args) {
             install_tray(cx, &services, &store);
             follow_autostart_setting(&store, &services, cx);
             follow_takeover_setting(&store, &services, cx);
-            follow_win_e_hook(&store, &services, cx);
         }
         // The shell registration follows the setting in every process that is running, resident
         // or not (a standalone Arke started through the folder verb keeps it repaired too).
@@ -543,7 +467,6 @@ fn app_main(mut args: Args) {
             global_search::GlobalSearch::init(
                 Arc::clone(&services.fs),
                 Arc::clone(&services.shell),
-                global_search::Roots::LocalDrives,
                 global_search::default_cache_path(),
                 cx,
             );
@@ -568,22 +491,18 @@ fn app_main(mut args: Args) {
                 // gpui quits by itself when the last window closes here.
                 cx.on_window_closed(|cx, _| {
                     if cx.windows().is_empty() {
-                        update_quiet::note_quit(update_quiet::QuitReason::User);
                     }
                 })
                 .detach();
             }
             cx.spawn(async move |cx| {
                 cx.background_executor()
-                    .timer(Duration::from_secs(15))
                     .await;
-                if let Ok(Some(file)) = pending_rx.recv_async().await {
                     cx.update(|cx| update_quiet::restore(file, cx));
                 }
                 loop {
                     cx.update(update::auto_check);
                     cx.background_executor()
-                        .timer(Duration::from_secs(3600))
                         .await;
                 }
             })
@@ -618,13 +537,10 @@ fn app_main(mut args: Args) {
     });
 }
 
-/// Drives removed, locked or dismounted from outside Arke: watchers on them were already closed
 /// on the notification thread (`win_devnotify.rs`); here every window moves its tabs off the drive.
 fn follow_drive_removals(cx: &mut App) {
     let events = win_devnotify::start();
     cx.spawn(async move |cx| {
-        while let Ok(event) = events.recv_async().await {
-            let win_devnotify::DriveEvent::Leaving(drive) = event;
             cx.update(|cx| workspace::leave_drive_everywhere(&drive, cx));
         }
     })
@@ -632,15 +548,12 @@ fn follow_drive_removals(cx: &mut App) {
 }
 
 /// "Start at Windows sign-in": when on, put a shortcut in the Startup folder pointing at the
-/// current exe (rewritten every launch so it follows a moved exe); when off, delete it. Runs in the
 /// background, no registry.
 fn follow_autostart_setting(
-    store: &gpui::Entity<settings::SettingsStore>,
     services: &Services,
     cx: &mut App,
 ) {
     let shell = Arc::clone(&services.shell);
-    let mut applied: Option<bool> = None;
     cx.observe(store, move |store, cx| {
         let store = store.read(cx);
         // Before settings load the values are defaults; don't delete the shortcut based on them.
@@ -659,7 +572,6 @@ fn follow_autostart_setting(
         }
         let shell = Arc::clone(&shell);
         explorer::spawn_thread("autostart", move || {
-            if let Err(err) = shell.set_autostart(wanted) {
                 log::warn!("autostart shortcut not updated: {err}");
             }
         });
@@ -671,7 +583,6 @@ fn follow_autostart_setting(
 /// moved exe) and whenever it is turned on; when turned off, delete it. Background thread, no
 /// registry.
 fn follow_start_menu_setting(
-    store: &gpui::Entity<settings::SettingsStore>,
     services: &Services,
     cx: &mut App,
 ) {
@@ -680,7 +591,6 @@ fn follow_start_menu_setting(
         return;
     }
     let shell = Arc::clone(&services.shell);
-    let mut applied: Option<bool> = None;
     let mut apply = move |store: &settings::SettingsStore| {
         if !store.loaded {
             return;
@@ -696,7 +606,6 @@ fn follow_start_menu_setting(
         }
         let shell = Arc::clone(&shell);
         explorer::spawn_thread("start-menu", move || {
-            if let Err(err) = shell.set_start_menu(wanted) {
                 log::warn!("Start menu shortcut not updated: {err}");
             }
         });
@@ -706,25 +615,18 @@ fn follow_start_menu_setting(
         .detach();
 }
 
-/// "Open folders in Arke": while the setting is on (and Arke stays in the background), watch for new
-/// File Explorer windows and show their folders here instead (`win_takeover.rs`). Turning the
 /// setting off stops the watcher at once.
 fn follow_takeover_setting(
-    store: &gpui::Entity<settings::SettingsStore>,
     services: &Services,
     cx: &mut App,
 ) {
-    let (tx, rx) = flume::unbounded::<win_takeover::OpenRequest>();
     let services = services.clone();
     cx.spawn(async move |cx| {
-        while let Ok(request) = rx.recv_async().await {
             let opened = cx.update(|cx| open_taken_over(cx, &services, &request));
             let _ = request.reply.send(opened);
         }
     })
     .detach();
-    let watcher: std::rc::Rc<std::cell::RefCell<Option<win_takeover::Watcher>>> =
-        std::rc::Rc::default();
     let apply = move |store: &settings::SettingsStore| {
         // Before settings load the values are defaults.
         if !store.loaded {
@@ -746,21 +648,8 @@ fn follow_takeover_setting(
         .detach();
 }
 
-/// "Win+E opens Arke too" on PCs where Windows sends Win+E straight to File Explorer instead of
-/// asking the registration (`win_e_hook.rs`, #34): while the setting is on and Arke stays in the
-/// background, a keyboard hook takes Win+E there. Everywhere else the registration does the job and
-/// no hook runs. Windows can switch that path on or off when Explorer restarts, so it is looked at
 /// again every half minute (one registry read, off the UI thread).
-fn follow_win_e_hook(
-    store: &gpui::Entity<settings::SettingsStore>,
-    services: &Services,
-    cx: &mut App,
 ) {
-    use std::cell::{Cell, RefCell};
-    use std::rc::Rc;
-    // `ARKE_WIN_E_HOOK` acts as if Windows sent Win+E straight to File Explorer, so the hook can be
-    // checked end to end on a PC without that (live checks also set `ARKE_NO_FOLDER_HANDLER`).
-    let forced = std::env::var_os("ARKE_WIN_E_HOOK").is_some();
     if !forced && !folder_handler::shell_allowed() {
         return;
     }
@@ -774,10 +663,7 @@ fn follow_win_e_hook(
         }
     })
     .detach();
-    let hook: Rc<RefCell<Option<win_e_hook::Hook>>> = Rc::default();
-    let direct_launch = Rc::new(Cell::new(false));
     let apply = {
-        let direct_launch = Rc::clone(&direct_launch);
         move |store: &settings::SettingsStore| {
             // Before settings load the values are defaults.
             if !store.loaded {
@@ -790,15 +676,12 @@ fn follow_win_e_hook(
                 && direct_launch.get();
             let mut hook = hook.borrow_mut();
             if wanted && hook.is_none() {
-                *hook = win_e_hook::Hook::start(tx.clone());
             } else if !wanted && hook.is_some() {
                 *hook = None;
             }
         }
     };
-    let apply = Rc::new(apply);
     {
-        let apply = Rc::clone(&apply);
         cx.observe(store, move |store, cx| apply(store.read(cx)))
             .detach();
     }
@@ -807,11 +690,10 @@ fn follow_win_e_hook(
         loop {
             let active = cx
                 .background_executor()
-                .spawn(async move { forced || win_e_hook::direct_launch_active() })
+        .spawn(async move { forced })
                 .await;
             if direct_launch.replace(active) != active {
                 log::info!(
-                    "Win+E: Windows direct launch {}",
                     if active { "on" } else { "off" }
                 );
             }
@@ -820,15 +702,12 @@ fn follow_win_e_hook(
             };
             cx.update(|cx| apply(store.read(cx)));
             cx.background_executor()
-                .timer(Duration::from_secs(30))
                 .await;
         }
     })
     .detach();
 }
 
-/// Opens a window showing what an Explorer window showed. Answers whether Arke has a window.
-fn open_taken_over(cx: &mut App, services: &Services, request: &win_takeover::OpenRequest) -> bool {
     open_target(
         cx,
         services,
@@ -838,15 +717,12 @@ fn open_taken_over(cx: &mut App, services: &Services, request: &win_takeover::Op
     )
 }
 
-/// Shows a folder, Home or the Recycle Bin (with `select` selected) and brings it to the front: in
 /// single window mode as a tab in the window used last (`tab_host`), otherwise in a new window.
-/// `explorer_thread` is the thread of the Explorer window being replaced, if any.
 fn open_target(
     cx: &mut App,
     services: &Services,
     target: Target,
     select: &[String],
-    explorer_thread: Option<u32>,
 ) -> bool {
     open_target_timed(cx, services, target, select, explorer_thread, None)
 }
@@ -858,16 +734,12 @@ fn open_target_timed(
     services: &Services,
     target: Target,
     select: &[String],
-    explorer_thread: Option<u32>,
-    received: Option<Instant>,
 ) -> bool {
-    let select: Vec<Arc<str>> = select.iter().map(|n| Arc::from(n.as_str())).collect();
     if let Some(host) = tab_host(cx)
         && show_in_tab(cx, host, target.clone(), select.clone(), explorer_thread)
     {
         return true;
     }
-    // Win+E (File Explorer's Home) with no window open: Arke starting, as "New windows open to"
     // says (the last session, say).
     let asked =
         (target != Target::Home || last_window(cx).is_some()).then_some(Asked { target, select });
@@ -884,10 +756,8 @@ fn open_target_timed(
     shown.is_ok()
 }
 
-/// The window a folder from another program, Win+E or Arke started again open in as a tab: the
 /// one used last, else the newest. `None` (open a window) when no window is open or single window
 /// mode is off.
-fn tab_host(cx: &mut App) -> Option<gpui::WindowHandle<Workspace>> {
     if !settings::SettingsStore::global(cx)
         .read(cx)
         .settings
@@ -903,8 +773,6 @@ fn show_in_tab(
     cx: &mut App,
     host: gpui::WindowHandle<Workspace>,
     target: Target,
-    select: Vec<Arc<str>>,
-    explorer_thread: Option<u32>,
 ) -> bool {
     let shown = host.update(cx, |workspace, window, cx| {
         workspace.open_external(target, select, window, cx);
@@ -916,7 +784,6 @@ fn show_in_tab(
     shown.is_ok()
 }
 
-/// Arke asked to open with no folder (Win+E, Arke started again): in single window mode a tab in
 /// the window used last, on what "New windows open to" says ([`fresh_tab`]); otherwise a window
 /// started like Arke itself.
 fn open_fresh(cx: &mut App, services: &Services, received: Instant) -> bool {
@@ -925,7 +792,6 @@ fn open_fresh(cx: &mut App, services: &Services, received: Instant) -> bool {
             let s = &settings::SettingsStore::global(cx).read(cx).settings;
             fresh_tab(s.start_location, s.recent.first().cloned(), home_folder())
         };
-        if show_in_tab(cx, host, target, Vec::new(), None) {
             return true;
         }
     }
@@ -934,7 +800,6 @@ fn open_fresh(cx: &mut App, services: &Services, received: Instant) -> bool {
 
 /// What a tab opened with no folder shows, after "New windows open to": the last tabs are open
 /// already, so that one shows Home, as a second window does (#178).
-fn fresh_tab(start: settings::StartLocation, last: Option<PathBuf>, home: PathBuf) -> Target {
     use settings::StartLocation;
     match start {
         StartLocation::HomePage | StartLocation::LastSession => Target::Home,
@@ -945,11 +810,9 @@ fn fresh_tab(start: settings::StartLocation, last: Option<PathBuf>, home: PathBu
 
 /// The user profile folder (string handling only).
 fn home_folder() -> PathBuf {
-    std::env::var_os("USERPROFILE").map_or_else(|| PathBuf::from("C:\\"), PathBuf::from)
 }
 
 /// A request from another `arke.exe` (or the shell through it) to open something.
-fn handle_open(cx: &mut App, services: &Services, open: OpenRequest, received: Instant) -> bool {
     let started_at = instant_from_unix_ms(open.launched_unix_ms);
     let bench = open.bench.map(|mode| Bench::new(mode, open.bench_out));
     // The sender was just started by the user or the shell and passed on its foreground right
@@ -974,10 +837,7 @@ fn handle_open(cx: &mut App, services: &Services, open: OpenRequest, received: I
 }
 
 /// How long after a maximized window opened behind the others Windows may still activate it: it
-/// shows such a window later (`ShowWindowAsync(SW_MAXIMIZE)`), and maximizing always activates.
-const BEHIND_SETTLE: Duration = Duration::from_millis(250);
 
-/// Opens the other windows of the last session behind `front` (the window that took the one used
 /// last, or the window something was asked for in), each where it was, a turn apart: the request
 /// that started the session, a second `arke.exe` waiting for its answer (`instance.rs`), is
 /// answered once `front` is up. Then `front` comes forward again, ahead of any of them that
@@ -985,12 +845,10 @@ const BEHIND_SETTLE: Duration = Duration::from_millis(250);
 pub(crate) fn open_session_windows(
     cx: &mut App,
     services: &Services,
-    windows: Vec<settings::SessionWindow>,
     front: gpui::AnyWindowHandle,
 ) {
     let services = services.clone();
     cx.spawn(async move |cx| {
-        let mut behind = Vec::new();
         // The one used last of these opens last, so after `front` it is the next in line.
         for saved in windows.into_iter().rev() {
             next_turn().await;
@@ -1009,7 +867,6 @@ pub(crate) fn open_session_windows(
             });
             behind.extend(opened.map(gpui::AnyWindowHandle::from));
         }
-        cx.background_executor().timer(BEHIND_SETTLE).await;
         cx.update(|cx| {
             // Unless the user went on to another window meanwhile.
             let last = cx
@@ -1035,7 +892,6 @@ async fn next_turn() {
     let mut yielded = false;
     std::future::poll_fn(|task| {
         if yielded {
-            std::task::Poll::Ready(())
         } else {
             yielded = true;
             task.waker().wake_by_ref();
@@ -1046,8 +902,6 @@ async fn next_turn() {
 }
 
 /// The Arke window used last, else the newest; `None` when no window is open.
-fn last_window(cx: &App) -> Option<gpui::WindowHandle<Workspace>> {
-    let windows: Vec<_> = cx
         .windows()
         .into_iter()
         .filter_map(|w| w.downcast::<Workspace>())
@@ -1060,48 +914,38 @@ fn last_window(cx: &App) -> Option<gpui::WindowHandle<Workspace>> {
 }
 
 /// `last` if it is still open, otherwise the newest window.
-fn pick_tab_host<H: Copy + PartialEq>(windows: &[H], last: Option<H>) -> Option<H> {
     last.filter(|l| windows.contains(l))
         .or_else(|| windows.last().copied())
 }
 
 /// Brings Arke's window to the front, even when another program owns the foreground (a window
-/// opened for a File Explorer window that was just replaced, or by a folder the shell handed over).
-fn bring_to_front(window: &gpui::Window, explorer_thread: Option<u32>) {
-    if let Some(hwnd) = explorer::Explorer::owner_from(window) {
         win::bring_to_front(hwnd, explorer_thread.filter(|&t| t != 0));
     }
 }
 
 /// "Show in folder" while Arke is the folder handler: a stand-in shell window for the folder that
 /// collects what the caller selects (`win_openinfolder.rs`) and forwards it to the running Arke.
-fn shell_window(args: &Args) -> Option<win_openinfolder::Linger> {
     let folder = args.path.as_ref().filter(|p| p.is_absolute())?;
-    // `--new-window` is Arke's own "Open in new window": no caller selects anything.
     if args.background
         || args.quit
         || args.new_window
         || args.page.is_some()
         || args.bench.is_some()
-        || std::env::var_os("ARKE_NO_SHELL_WINDOW").is_some()
     {
         return None;
     }
     // What the shell or the calling program passed, to tell "Show in folder" callers apart.
     log::info!(
         "opened with {:?}",
-        std::env::args_os().skip(1).collect::<Vec<_>>()
     );
     win_openinfolder::start(folder.clone(), |folder, items| {
         let count = items.len();
-        let outcome = instance::send(&Request::Select { folder, items }, instance::CLIENT_TIMEOUT);
         log::info!("shell window: {count} selected items forwarded: {outcome:?}");
     })
 }
 
 /// Selects `items` in the newest window that shows (or is loading) their folder, or opens one.
 fn select_items(cx: &mut App, services: &Services, folder: &Path, items: &[PathBuf]) -> bool {
-    let full: Vec<String> = items
         .iter()
         .map(|p| p.to_string_lossy().into_owned())
         .collect();
@@ -1109,7 +953,6 @@ fn select_items(cx: &mut App, services: &Services, folder: &Path, items: &[PathB
     if names.is_empty() {
         return false;
     }
-    let shown: Vec<Arc<str>> = names.iter().map(|n| Arc::from(n.as_str())).collect();
     for handle in cx.windows().into_iter().rev() {
         let Some(workspace) = handle.downcast::<Workspace>() else {
             continue;
@@ -1119,7 +962,6 @@ fn select_items(cx: &mut App, services: &Services, folder: &Path, items: &[PathB
                 view.select_in_folder(folder, shown.clone(), cx)
             })
         });
-        if matches!(done, Ok(true)) {
             log::info!(
                 "selected {} items in the window showing {}",
                 shown.len(),
@@ -1137,36 +979,27 @@ fn select_items(cx: &mut App, services: &Services, folder: &Path, items: &[PathB
     )
 }
 
-/// Keep the taskbar jump list in sync with pinned and recent folders. One background thread handles
 /// only the latest request, so quick folder changes don't queue.
-fn follow_jump_list(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App) {
-    type Lists = (Vec<std::path::PathBuf>, Vec<std::path::PathBuf>);
     let (tx, rx) = flume::unbounded::<Lists>();
     explorer::spawn_thread("jump-list", move || {
-        while let Ok(mut lists) = rx.recv() {
-            while let Ok(newer) = rx.try_recv() {
                 lists = newer;
             }
-            if let Err(err) = win_jumplist::update(&lists.0, &lists.1) {
                 log::info!("jump list not updated: {err}");
             }
         }
     });
-    let mut applied: Option<Lists> = None;
     cx.observe(store, move |store, cx| {
         let store = store.read(cx);
         if !store.loaded {
             return;
         }
         let s = &store.settings;
-        let pinned: Vec<_> = s
             .favorites
             .iter()
             .flatten()
             .chain(&s.pinned)
             .cloned()
             .collect();
-        let recent: Vec<_> = s.recent.iter().take(12).cloned().collect();
         let lists = (pinned, recent);
         if applied.as_ref() == Some(&lists) {
             return;
@@ -1179,8 +1012,6 @@ fn follow_jump_list(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App)
 
 /// "Language" setting: switch when loaded or changed and redraw all windows (input placeholders
 /// update in new tabs only).
-fn follow_language_setting(store: &gpui::Entity<settings::SettingsStore>, cx: &mut App) {
-    let mut applied: Option<settings::Language> = None;
     cx.observe(store, move |store, cx| {
         let language = store.read(cx).settings.language;
         if applied == Some(language) {
@@ -1237,18 +1068,13 @@ fn quit_with_last_window_unless_resident(cx: &mut App) {
             .keep_running;
         if !keep && cx.windows().is_empty() {
             log::info!("background residency off: last window closed, quitting");
-            update_quiet::quit(update_quiet::QuitReason::User, cx);
         }
     })
     .detach();
 }
 
-/// Mica backdrop on Windows 11. Off when ARKE_THEME forces light or dark, since Mica follows the
-/// system theme and a mismatch looks washed out. `ARKE_NO_MICA` disables it.
 fn use_mica() -> bool {
     win::supports_mica()
-        && std::env::var_os("ARKE_NO_MICA").is_none()
-        && std::env::var_os("ARKE_THEME").is_none()
 }
 
 /// New window size: 75% of the usable screen (so large screens don't get a tiny window), clamped to
@@ -1269,17 +1095,12 @@ fn default_window_size(cx: &App) -> gpui::Size<gpui::Pixels> {
 }
 
 /// Where a saved window opens again.
-#[derive(Clone, Copy, Debug, PartialEq)]
-struct Restored {
     bounds: WindowBounds,
     /// The screen it goes on; `None` for the main one. Windows checks the bounds against this
     /// screen, and would put a window meant for another one at the main screen's default spot.
-    display: Option<gpui::DisplayId>,
 }
 
 /// Last window position, on the screen that shows most of it.
-fn restored_bounds(place: settings::WindowPlace, cx: &App) -> Option<Restored> {
-    let screens: Vec<_> = cx.displays().iter().map(|d| (d.id(), d.bounds())).collect();
     let main = cx.primary_display().map(|d| d.bounds());
     place_on_screens(place, &screens, main)
 }
@@ -1290,9 +1111,6 @@ fn restored_bounds(place: settings::WindowPlace, cx: &App) -> Option<Restored> {
 /// gets the default spot (`None`).
 fn place_on_screens(
     place: settings::WindowPlace,
-    screens: &[(gpui::DisplayId, Bounds<gpui::Pixels>)],
-    main: Option<Bounds<gpui::Pixels>>,
-) -> Option<Restored> {
     let bounds = Bounds::new(
         gpui::point(px(place.x), px(place.y)),
         size(px(place.width.max(720.)), px(place.height.max(480.))),
@@ -1308,9 +1126,7 @@ fn place_on_screens(
         .max_by(|a, b| a.1.total_cmp(&b.1))
         .map(|(id, _)| id);
     match screen {
-        Some(id) => Some(Restored {
             bounds: if place.maximized {
-                WindowBounds::Maximized(bounds)
             } else {
                 WindowBounds::Windowed(bounds)
             },
@@ -1322,8 +1138,6 @@ fn place_on_screens(
                 main.origin.x + (main.size.width - size.width) / 2.,
                 main.origin.y + (main.size.height - size.height) / 2.,
             );
-            Restored {
-                bounds: WindowBounds::Maximized(Bounds::new(origin, size)),
                 display: None,
             }
         }),
@@ -1339,7 +1153,6 @@ pub(crate) fn move_to_place(window: &mut gpui::Window, place: settings::WindowPl
     };
     let bounds = restored.bounds.get_bounds();
     // gpui can resize a window but not move it.
-    if let Some(hwnd) = explorer::Explorer::owner_from(window) {
         let screen = restored
             .display
             .and_then(|id| cx.find_display(id))
@@ -1348,7 +1161,6 @@ pub(crate) fn move_to_place(window: &mut gpui::Window, place: settings::WindowPl
             win::move_window(hwnd, u64::from(screen.id()), screen.bounds(), bounds);
         }
     }
-    if matches!(restored.bounds, WindowBounds::Maximized(_)) && !window.is_maximized() {
         window.zoom_window();
     }
 }
@@ -1358,7 +1170,6 @@ pub(crate) fn move_to_place(window: &mut gpui::Window, place: settings::WindowPl
 fn run_thumb_host() -> bool {
     if std::env::args_os()
         .nth(1)
-        .is_none_or(|a| a != thumb_host::HOST_ARG)
     {
         return false;
     }
@@ -1371,7 +1182,6 @@ fn run_thumb_host() -> bool {
 fn run_shell_host() -> bool {
     if std::env::args_os()
         .nth(1)
-        .is_none_or(|a| a != shell_host::HOST_ARG)
     {
         return false;
     }
@@ -1380,52 +1190,34 @@ fn run_shell_host() -> bool {
     true
 }
 
-/// Start the "More options" menu process early (it reads the menu once) so the first right-click
 /// doesn't wait.
 fn prewarm_shell_host() {
     let _ = std::thread::Builder::new()
         .name("shell-host-prewarm".into())
         .spawn(|| {
-            std::thread::sleep(Duration::from_secs(1));
             shell_host::prewarm();
         });
 }
 
-enum HandOff {
-    /// Resident process opened the window; this process can exit
-    Done,
     /// No resident process; this one becomes resident
-    BecomeResident(instance::Listener),
-    /// Resident process unresponsive (or we lost the race and can't connect); open a window here
     /// without residency
     Standalone,
 }
 
-fn hand_off(request: &Request) -> HandOff {
     for _ in 0..2 {
-        match instance::send(request, instance::CLIENT_TIMEOUT) {
-            SendOutcome::Delivered => return HandOff::Done,
-            SendOutcome::Failed => {
                 log::warn!("resident process did not respond in time, running standalone");
-                return HandOff::Standalone;
             }
-            SendOutcome::NoServer => {
-                if matches!(request, Request::Quit) {
-                    return HandOff::Standalone;
                 }
                 if let Some(listener) = instance::listen() {
-                    return HandOff::BecomeResident(listener);
                 }
                 // Two Arkes launched together and the other became resident first: retry the
                 // handoff once.
             }
         }
     }
-    HandOff::Standalone
 }
 
 fn start_resident_service(cx: &mut App, listener: instance::Listener, services: Services) {
-    let (tx, rx) = flume::unbounded::<(Request, Instant, flume::Sender<bool>)>();
     instance::serve(listener, move |request| {
         let received = Instant::now();
         let (ack_tx, ack_rx) = flume::bounded(1);
@@ -1435,18 +1227,12 @@ fn start_resident_service(cx: &mut App, listener: instance::Listener, services: 
         // If the UI thread doesn't handle it in time, reply failure so the sender opens its own
         // window.
         ack_rx
-            .recv_timeout(instance::SERVER_ACK_TIMEOUT)
             .unwrap_or(false)
     });
     cx.spawn(async move |cx| {
-        while let Ok((request, received, ack)) = rx.recv_async().await {
             let handled = cx.update(|cx| match request {
-                Request::Quit => {
-                    update_quiet::quit(update_quiet::QuitReason::Other, cx);
                     true
                 }
-                Request::Select { folder, items } => select_items(cx, &services, &folder, &items),
-                Request::Open(open) => handle_open(cx, &services, open, received),
             });
             let _ = ack.send(handled);
         }
@@ -1454,11 +1240,7 @@ fn start_resident_service(cx: &mut App, listener: instance::Listener, services: 
     .detach();
 }
 
-/// Resident mode: a notification area icon so Arke is reachable with all windows closed (left click
-/// opens a window, the menu can quit). `ARKE_NO_TRAY` skips it (temporary processes for automated
 /// tests and screenshots).
-fn install_tray(cx: &mut App, services: &Services, store: &gpui::Entity<settings::SettingsStore>) {
-    if std::env::var_os("ARKE_NO_TRAY").is_some() {
         return;
     }
     let Some(commands) = tray::install() else {
@@ -1485,9 +1267,7 @@ fn install_tray(cx: &mut App, services: &Services, store: &gpui::Entity<settings
     .detach();
     let services = services.clone();
     cx.spawn(async move |cx| {
-        while let Ok(command) = commands.recv_async().await {
             cx.update(|cx| match command {
-                tray::TrayCommand::Open => {
                     // Brings back the window used last (restored if minimized); a new window only
                     // when none is open, so repeated or double clicks don't pile up windows.
                     if let Some(window) = last_window(cx) {
@@ -1512,10 +1292,8 @@ fn install_tray(cx: &mut App, services: &Services, store: &gpui::Entity<settings
                 }
                 tray::TrayCommand::Quit => {
                     tray::remove();
-                    update_quiet::quit(update_quiet::QuitReason::User, cx);
                 }
                 tray::TrayCommand::Update => {
-                    // The window used last (or a new one) shows the update's notes, with Download.
                     let window = last_window(cx).or_else(|| {
                         open_explorer(cx, &services, None, None, Instant::now())
                             .then(|| last_window(cx))
@@ -1527,7 +1305,6 @@ fn install_tray(cx: &mut App, services: &Services, store: &gpui::Entity<settings
                         let _ = window.update(cx, |ws, window, cx| {
                             bring_to_front(window, None);
                             ws.open_whats_new(
-                                workspace::whats_new_page::Mode::Available(release),
                                 window,
                                 cx,
                             );
@@ -1555,21 +1332,16 @@ fn install_tray(cx: &mut App, services: &Services, store: &gpui::Entity<settings
 fn open_explorer(
     cx: &mut App,
     services: &Services,
-    path: Option<PathBuf>,
-    bench: Option<Bench>,
     started_at: Instant,
 ) -> bool {
     let asked = path.map(Asked::folder);
     open_explorer_window(cx, services, asked, bench, started_at, None).is_some()
 }
 
-/// Opens a window (at `path`, or where the settings say) and brings it to the front. `received`:
 /// when the request for it arrived, which its start is timed from in the log.
 fn open_in_front(
     cx: &mut App,
     services: &Services,
-    path: Option<PathBuf>,
-    bench: Option<Bench>,
     started_at: Instant,
     received: Instant,
 ) -> bool {
@@ -1584,33 +1356,25 @@ fn open_in_front(
 }
 
 /// What a window is opened for: a folder (from the command line, another program or a second
-/// `arke.exe`), Home or the Recycle Bin, with the items to select in it.
 struct Asked {
     target: Target,
-    select: Vec<Arc<str>>,
 }
 
 impl Asked {
     const fn folder(path: PathBuf) -> Self {
         Self {
             target: Target::Folder(path),
-            select: Vec::new(),
         }
     }
 }
 
-/// Opens a window on what was `asked` for, or where "New windows open to" says. The first window
 /// with "Last tabs" brings back the last session, also when something was asked for: that opens
 /// as a tab of the window used last in single window mode, else in a window of its own in front of
 /// the session's.
 fn open_explorer_window(
     cx: &mut App,
     services: &Services,
-    asked: Option<Asked>,
-    bench: Option<Bench>,
     started_at: Instant,
-    received: Option<Instant>,
-) -> Option<gpui::WindowHandle<Workspace>> {
     // The startup path is string handling only; existence isn't checked, since startup must not
     // touch locations that might block. No path given: if settings say "last location/last tabs",
     // open there (switching once settings finish loading).
@@ -1622,8 +1386,6 @@ fn open_explorer_window(
             (asked.is_none() && store.loaded && start == settings::StartLocation::LastFolder)
                 .then(|| store.settings.recent.first().cloned())
                 .flatten();
-        // Restore the last session only when no other window exists, otherwise each new window
-        // would duplicate it. Read before any window opens and saves its own tabs over it.
         let sessions = if store.loaded
             && first_window
             && bench.is_none()
@@ -1631,7 +1393,6 @@ fn open_explorer_window(
         {
             store.settings.last_windows()
         } else {
-            Vec::new()
         };
         // Window position: the first window uses the last one; later windows are centered instead
         // of stacking.
@@ -1658,7 +1419,6 @@ fn open_explorer_window(
     if let Some(asked) = asked {
         let path = match &asked.target {
             Target::Folder(path) => path.clone(),
-            Target::Home | Target::RecycleBin => home_folder(),
         };
         let restored = place.and_then(|p| restored_bounds(p, cx));
         let start = WindowStart {
@@ -1717,9 +1477,7 @@ fn open_explorer_window(
 pub(crate) fn open_moved_tab_window(
     cx: &mut App,
     services: &Services,
-    moved: workspace::MovedTab,
     bounds: Bounds<gpui::Pixels>,
-) -> Option<gpui::WindowHandle<Workspace>> {
     let path = moved.first_folder()?.to_path_buf();
     let display = cx
         .displays()
@@ -1747,11 +1505,8 @@ struct WindowStart {
     /// No path was given: once settings load, go where "New windows open to" says.
     default: bool,
     /// Tabs to restore (the first opens on `path`).
-    session: Option<settings::Session>,
     /// `None`: centered, at the default size.
-    bounds: Option<WindowBounds>,
     /// The screen `bounds` are on; `None`: the main one.
-    display: Option<gpui::DisplayId>,
     /// Takes the foreground; the other windows of a restored session open behind.
     focus: bool,
 }
@@ -1760,35 +1515,25 @@ fn open_workspace_window(
     cx: &mut App,
     services: &Services,
     start: WindowStart,
-    bench: Option<Bench>,
     started_at: Instant,
-    received: Option<Instant>,
-) -> Option<gpui::WindowHandle<Workspace>> {
     let services = services.clone();
     let window_bounds = start.bounds.unwrap_or_else(|| {
         WindowBounds::Windowed(Bounds::centered(None, default_window_size(cx), cx))
     });
     let opened = cx.open_window(
-        WindowOptions {
             window_bounds: Some(window_bounds),
             // The title bar is drawn by us (the frame's top bar); the system keeps only the border
             // and snap layouts.
-            titlebar: Some(TitlebarOptions {
                 title: Some("Arke".into()),
                 appears_transparent: true,
-                ..Default::default()
             }),
             focus: start.focus,
             display_id: start.display,
             window_min_size: Some(size(theme::scaled_px(720.), theme::scaled_px(480.))),
-            // Windows 11: Mica shows through the frame (sidebar, top bar); the list is a layer on
             // top.
             window_background: if theme::mica() {
-                gpui::WindowBackgroundAppearance::MicaBackdrop
             } else {
-                gpui::WindowBackgroundAppearance::Opaque
             },
-            ..Default::default()
         },
         move |window, cx| {
             cx.new(|cx| {
@@ -1811,8 +1556,6 @@ fn open_workspace_window(
         },
     );
     match opened {
-        Ok(handle) => Some(handle),
-        Err(err) => {
             log::error!("cannot open window: {err:#}");
             None
         }
@@ -1824,7 +1567,6 @@ mod arg_tests {
     use super::*;
 
     fn parse(args: &[&str]) -> Args {
-        parse_args_from(args.iter().map(std::ffi::OsString::from))
     }
 
     #[test]
@@ -1832,12 +1574,8 @@ mod arg_tests {
         // `"arke.exe" "C:\"` arrives as `C:"`.
         assert_eq!(parse(&["C:\""]).path, Some(PathBuf::from(r"C:\")));
         assert_eq!(
-            parse(&[r#"D:\my docs""#]).path,
-            Some(PathBuf::from(r"D:\my docs\"))
         );
         assert_eq!(
-            parse(&[r"D:\my docs"]).path,
-            Some(PathBuf::from(r"D:\my docs"))
         );
         assert_eq!(parse(&[r"C:\"]).path, Some(PathBuf::from(r"C:\")));
     }
@@ -1867,7 +1605,6 @@ mod arg_tests {
         );
     }
 
-    /// Win+E or Arke started again with a window open: the tab goes where "New windows open to"
     /// says, Home when that is the last tabs (they are open already).
     #[test]
     fn a_tab_with_no_folder_follows_the_startup_setting() {
@@ -1908,9 +1645,7 @@ mod arg_tests {
     #[test]
     fn window_benches_still_parse() {
         let args = parse(&[r"C:\big", "--bench", "scroll"]);
-        assert_eq!(args.window_bench(), Some(BenchMode::Scroll));
         assert_eq!(args.path, Some(PathBuf::from(r"C:\big")));
-        assert_eq!(parse(&["--bench"]).window_bench(), Some(BenchMode::Startup));
     }
 
     #[test]
@@ -1943,7 +1678,6 @@ mod arg_tests {
     fn a_window_comes_back_on_the_screen_it_was_on() {
         let main = screen(0., 0., 2560., 1440.);
         let second = screen(2560., 0., 1920., 1080.);
-        let (one, two) = (gpui::DisplayId::new(1), gpui::DisplayId::new(2));
         let screens = [(one, main), (two, second)];
         let on_second = place_on_screens(place(2700., 100., false), &screens, Some(main)).unwrap();
         assert_eq!(on_second.display, Some(two));
@@ -1953,7 +1687,6 @@ mod arg_tests {
         );
         let maximized = place_on_screens(place(2700., 100., true), &screens, Some(main)).unwrap();
         assert_eq!(maximized.display, Some(two));
-        assert!(matches!(maximized.bounds, WindowBounds::Maximized(_)));
         // Across the edge: the screen that shows more of it.
         let across = place_on_screens(place(2200., 100., false), &screens, Some(main)).unwrap();
         assert_eq!(across.display, Some(two));
@@ -1966,7 +1699,6 @@ mod arg_tests {
     #[test]
     fn a_window_whose_screen_is_gone_falls_back_to_the_main_one() {
         let main = screen(0., 0., 2560., 1440.);
-        let screens = [(gpui::DisplayId::new(1), main)];
         assert_eq!(
             place_on_screens(place(3000., 100., false), &screens, Some(main)),
             None
@@ -1975,9 +1707,7 @@ mod arg_tests {
         assert_eq!(maximized.display, None);
         assert_eq!(
             maximized.bounds,
-            WindowBounds::Maximized(screen(780., 370., 1000., 700.))
         );
-        // Only a sliver left on a screen is as good as gone.
         assert_eq!(
             place_on_screens(place(2500., 100., false), &screens, Some(main)),
             None
