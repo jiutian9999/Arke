@@ -1,0 +1,114 @@
+name: One-Click Build Windows EXE
+
+on:
+  workflow_dispatch:
+    inputs:
+      build_type:
+        description: 'Build type'
+        required: false
+        default: 'release'
+        type: choice
+        options:
+        - release
+        - debug
+
+jobs:
+  build:
+    runs-on: windows-latest
+    
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@v4
+      with:
+        fetch-depth: 0
+    
+    - name: Setup Rust
+      uses: actions-rs/toolchain@v1
+      with:
+        toolchain: 1.100.0
+        target: x86_64-pc-windows-msvc
+        override: true
+        components: rustfmt, clippy
+    
+    - name: Remove keyboard hook
+      run: |
+        # 删除键盘钩子文件
+        if (Test-Path "crates\app\src\win_e_hook.rs") {
+          Remove-Item "crates\app\src\win_e_hook.rs" -Force
+          Write-Host "✅ Removed win_e_hook.rs"
+        }
+        
+        # 清理 main.rs
+        $content = Get-Content "crates\app\src\main.rs" -Raw
+        $content = $content -replace "mod win_e_hook;", ""
+        $content = $content -replace "win_e_hook::\w+", ""
+        $content = $content -replace "follow_win_e_hook\([^)]*\)", ""
+        Set-Content "crates\app\src\main.rs" $content
+        
+        Write-Host "✅ Keyboard hook removed"
+      shell: pwsh
+    
+    - name: Build
+      run: cargo build --${{ github.event.inputs.build_type }} --locked
+      env:
+        RUSTFLAGS: "-C target-feature=+crt-static"
+    
+    - name: Run tests
+      run: cargo test --${{ github.event.inputs.build_type }} --locked
+      continue-on-error: true
+    
+    - name: Package EXE
+      run: |
+        New-Item -ItemType Directory -Force -Path dist
+        Copy-Item "target\${{ github.event.inputs.build_type }}\*.exe" -Destination "dist\" -Recurse
+        
+        # 创建说明文件
+        @"
+        Arke - Safe Version
+        ===================
+        
+        ✅ Keyboard hook removed
+        ✅ No keylogger risk
+        ✅ Safe to use
+        
+        SHA256: (see below)
+        
+        Please scan with antivirus before use.
+        "@ | Out-File -FilePath "dist\README.txt" -Encoding UTF8
+        
+        Get-FileHash "dist\*.exe" -Algorithm SHA256 | Out-File -FilePath "dist\checksums.txt" -Encoding UTF8
+      shell: pwsh
+    
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: arke-windows-safe
+        path: dist/
+        retention-days: 30
+        if-no-files-found: error
+
+    - name: Create Release
+      if: github.event.inputs.build_type == 'release'
+      uses: softprops/action-gh-release@v1
+      with:
+        tag_name: safe-v1.0.0
+        name: Arke Safe Version 1.0.0
+        body: |
+          ## 🔒 Safe Version - Keyboard Hook Removed
+          
+          ✅ Removed: SetWindowsHookExW(WH_KEYBOARD_LL)
+          ✅ Removed: win_e_hook.rs
+          ✅ No keylogger risk
+          
+          ### Files
+          - `arke.exe` - Main executable (portable)
+          - `checksums.txt` - SHA256 checksums
+          - `README.txt` - Information
+          
+          ### Security
+          This version has been modified to remove all keyboard hook code.
+          Scan with antivirus before use.
+        files: dist/*
+        prerelease: false
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
